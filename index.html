@@ -1,5 +1,4 @@
-
-<!DOCTYPE html>
+ñ<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
@@ -403,4 +402,729 @@ function showToast(msg){
 }
 
 // ---------- Generic bottom sheet ----------
-function op
+function openSheet(innerHtml){
+  return new Promise((resolve)=>{
+    const backdrop = document.createElement('div');
+    backdrop.className = 'sheet-backdrop';
+    backdrop.innerHTML = `<div class="sheet"><div class="sheet-handle"></div>${innerHtml}</div>`;
+    document.body.appendChild(backdrop);
+    function close(result){ backdrop.remove(); resolve(result); }
+    backdrop.addEventListener('click', (e)=>{ if(e.target === backdrop) close(null); });
+    resolve.close = close;
+    backdrop._close = close;
+    backdrop._sheet = backdrop.querySelector('.sheet');
+    window.__lastSheet = backdrop;
+  });
+}
+function closeSheet(){ if(window.__lastSheet) window.__lastSheet._close(null); }
+
+// ---------- Storage helpers ----------
+async function loadSettings(){
+  try{
+    const res = await window.storage.get('app-settings', false);
+    if(res && res.value) settings = JSON.parse(res.value);
+  }catch(e){ /* keep defaults */ }
+}
+async function saveSettings(){
+  try{ await window.storage.set('app-settings', JSON.stringify(settings), false); }catch(e){ /* ignore */ }
+}
+
+async function loadSession(){
+  try{
+    const meta = await window.storage.get('session-meta', false);
+    if(meta && meta.value) sessionMeta = JSON.parse(meta.value);
+  }catch(e){ sessionMeta = { createdAt: null, pageOrder: [] }; }
+
+  pagesById = {};
+  for(const id of sessionMeta.pageOrder){
+    try{
+      const res = await window.storage.get(`page:${id}`, false);
+      if(res && res.value) pagesById[id] = JSON.parse(res.value);
+    }catch(e){ /* missing */ }
+  }
+  sessionMeta.pageOrder = sessionMeta.pageOrder.filter(id => pagesById[id]);
+  render();
+}
+async function saveMeta(){
+  try{ await window.storage.set('session-meta', JSON.stringify(sessionMeta), false); }
+  catch(e){ showToast('No se pudo guardar la sesión.'); }
+}
+async function savePage(page){
+  try{ await window.storage.set(`page:${page.id}`, JSON.stringify(page), false); }
+  catch(e){ showToast('No se pudo guardar la página.'); }
+}
+async function deletePageStorage(id){
+  try{ await window.storage.delete(`page:${id}`, false); }catch(e){ /* ignore */ }
+}
+
+// ---------- Image processing ----------
+function fileToImage(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+function resizeToDataUrl(img, maxDim=1600){
+  const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+  const w = Math.round(img.width * scale);
+  const h = Math.round(img.height * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+  return canvas.toDataURL('image/jpeg', 0.82);
+}
+function loadImg(src){
+  return new Promise((resolve)=>{ const im = new Image(); im.onload = () => resolve(im); im.src = src; });
+}
+
+const FILTER_CSS = {
+  color: 'contrast(1.12) saturate(1.18) brightness(1.04)',
+  gray:  'grayscale(1) contrast(1.15) brightness(1.08)',
+  bw:    'grayscale(1) contrast(1.65) brightness(1.18)'
+};
+const FILTER_LABEL = { color: 'Color', gray: 'Grises', bw: 'B/N' };
+
+// ---------- Perspective warp (4 vértices independientes) ----------
+// quad = [TL, TR, BR, BL] each {x,y}. Maps a unit square (0,0)-(1,0)-(1,1)-(0,1)
+// onto that quad (classic Heckbert quad-mapping), so we can sample any point
+// inside an arbitrary (possibly non-rectangular) quad given normalized u,v.
+function computePerspectiveCoeffs(quad){
+  const p0=quad[0], p1=quad[1], p2=quad[2], p3=quad[3];
+  const dx1=p1.x-p2.x, dx2=p3.x-p2.x, dx3=p0.x-p1.x+p2.x-p3.x;
+  const dy1=p1.y-p2.y, dy2=p3.y-p2.y, dy3=p0.y-p1.y+p2.y-p3.y;
+  let a11,a12,a13,a21,a22,a23,a31,a32;
+  if(Math.abs(dx3) < 1e-9 && Math.abs(dy3) < 1e-9){
+    a11=p1.x-p0.x; a12=p2.x-p1.x; a13=p0.x;
+    a21=p1.y-p0.y; a22=p2.y-p1.y; a23=p0.y;
+    a31=0; a32=0;
+  } else {
+    const denom = dx1*dy2 - dx2*dy1;
+    const g = denom !== 0 ? (dx3*dy2 - dx2*dy3)/denom : 0;
+    const h = denom !== 0 ? (dx1*dy3 - dx3*dy1)/denom : 0;
+    a11=p1.x-p0.x+g*p1.x; a12=p3.x-p0.x+h*p3.x; a13=p0.x;
+    a21=p1.y-p0.y+g*p1.y; a22=p3.y-p0.y+h*p3.y; a23=p0.y;
+    a31=g; a32=h;
+  }
+  return {a11,a12,a13,a21,a22,a23,a31,a32,a33:1};
+}
+function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+function quadOutputSize(quad){
+  const [tl,tr,br,bl] = quad;
+  let w = Math.round((dist(tl,tr)+dist(bl,br))/2);
+  let h = Math.round((dist(tl,bl)+dist(tr,br))/2);
+  const maxDim = 1700;
+  const scale = Math.min(1, maxDim/Math.max(w,h,1));
+  w = Math.max(80, Math.round(w*scale));
+  h = Math.max(80, Math.round(h*scale));
+  return {w,h};
+}
+function rectToQuad(r){
+  return [{x:r.x,y:r.y},{x:r.x+r.w,y:r.y},{x:r.x+r.w,y:r.y+r.h},{x:r.x,y:r.y+r.h}];
+}
+function warpPerspective(img, quad, outW, outH){
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = img.width; srcCanvas.height = img.height;
+  const sctx = srcCanvas.getContext('2d');
+  sctx.drawImage(img, 0, 0);
+  const sw = img.width, sh = img.height;
+  const srcData = sctx.getImageData(0, 0, sw, sh).data;
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = outW; outCanvas.height = outH;
+  const octx = outCanvas.getContext('2d');
+  const outImageData = octx.createImageData(outW, outH);
+  const outData = outImageData.data;
+
+  const c = computePerspectiveCoeffs(quad);
+
+  for(let y=0; y<outH; y++){
+    const v = y/outH;
+    for(let x=0; x<outW; x++){
+      const u = x/outW;
+      const denom = c.a31*u + c.a32*v + c.a33;
+      let sx = (c.a11*u + c.a12*v + c.a13)/denom;
+      let sy = (c.a21*u + c.a22*v + c.a23)/denom;
+      sx = Math.max(0, Math.min(sw-1.001, sx));
+      sy = Math.max(0, Math.min(sh-1.001, sy));
+      const x0=Math.floor(sx), y0=Math.floor(sy), x1=x0+1, y1=y0+1;
+      const fx=sx-x0, fy=sy-y0;
+      const i00=(y0*sw+x0)*4, i10=(y0*sw+x1)*4, i01=(y1*sw+x0)*4, i11=(y1*sw+x1)*4;
+      const outIdx=(y*outW+x)*4;
+      for(let k=0;k<3;k++){
+        const top = srcData[i00+k]*(1-fx) + srcData[i10+k]*fx;
+        const bot = srcData[i01+k]*(1-fx) + srcData[i11+k]*fx;
+        outData[outIdx+k] = top*(1-fy) + bot*fy;
+      }
+      outData[outIdx+3] = 255;
+    }
+  }
+  octx.putImageData(outImageData, 0, 0);
+  return outCanvas;
+}
+async function warpAndFilter(sourceDataUrl, quad, filter){
+  const img = await loadImg(sourceDataUrl);
+  const q = quad || rectToQuad({x:0,y:0,w:img.width,h:img.height});
+  const {w,h} = quadOutputSize(q);
+  const warped = warpPerspective(img, q, w, h);
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.filter = FILTER_CSS[filter] || FILTER_CSS.bw;
+  ctx.drawImage(warped, 0, 0);
+  return canvas.toDataURL('image/jpeg', 0.85);
+}
+
+// ---------- Settings sheet ----------
+async function openSettingsSheet(){
+  const html = `
+    <h3>Ajustes de sesión</h3>
+    <p class="sub">Definí cómo salen las fotos nuevas por defecto. Siempre podés cambiarlo página por página.</p>
+    <div class="sheet-row">
+      <div class="sheet-row-label">Fotos nuevas</div>
+      <div class="segmented" id="segDefault">
+        <button data-df="color">Color</button>
+        <button data-df="bw">Blanco y negro</button>
+      </div>
+    </div>
+    <button class="btn-block btn-danger" id="btnResetInSheet">${ICONS.trash} Reiniciar sesión</button>
+    <button class="btn-block btn-ghost" id="btnCloseSettings">Cerrar</button>
+  `;
+  const p = openSheet(html);
+  const backdrop = window.__lastSheet;
+  const seg = backdrop.querySelector('#segDefault');
+  function paintSeg(){
+    seg.querySelectorAll('[data-df]').forEach(b => b.classList.toggle('active', b.dataset.df === settings.defaultFilter));
+  }
+  paintSeg();
+  seg.addEventListener('click', (e)=>{
+    const b = e.target.closest('[data-df]'); if(!b) return;
+    settings.defaultFilter = b.dataset.df; paintSeg(); saveSettings();
+  });
+  backdrop.querySelector('#btnResetInSheet').addEventListener('click', async ()=>{
+    closeSheet();
+    await resetSession();
+  });
+  backdrop.querySelector('#btnCloseSettings').addEventListener('click', closeSheet);
+  await p;
+}
+
+// ---------- PDF action sheet ----------
+async function openPdfSheet(){
+  const n = sessionMeta.pageOrder.length;
+  getPdfBlob(); // arranca a generarse ya en segundo plano, para que esté listo cuando se toque un botón
+  const html = `
+    <h3>Documento (${n} página${n===1?'':'s'})</h3>
+    <p class="sub">Se combinan todas las páginas de la sesión, en el orden en que están, en un solo PDF.</p>
+    <button class="btn-block btn-ok" id="btnShareInSheet">${ICONS.share} Compartir PDF</button>
+    <button class="btn-block btn-primary" id="btnExportInSheet">${ICONS.download} Descargar PDF</button>
+    <button class="btn-block btn-ghost" id="btnCloseSheet">Cancelar</button>
+  `;
+  const p = openSheet(html);
+  const backdrop = window.__lastSheet;
+  backdrop.querySelector('#btnExportInSheet').addEventListener('click', async ()=>{ closeSheet(); await exportPdf(); });
+  backdrop.querySelector('#btnShareInSheet').addEventListener('click', async ()=>{ closeSheet(); await sharePdf(); });
+  backdrop.querySelector('#btnCloseSheet').addEventListener('click', closeSheet);
+  await p;
+}
+
+// ---------- Detección automática de bordes (sugerencia, no obligatoria) ----------
+// Heurística simple por contraste: no es visión artificial "real", separa el
+// documento del fondo por diferencia de tono (funciona mejor cuando el fondo
+// contrasta con la hoja). Si no encuentra algo confiable, devuelve null y se
+// usa el recorte por defecto.
+function boxBlur3x3(gray, w, h){
+  const out = new Float32Array(w*h);
+  for(let y=0; y<h; y++){
+    for(let x=0; x<w; x++){
+      let sum=0, count=0;
+      for(let dy=-1; dy<=1; dy++){
+        for(let dx=-1; dx<=1; dx++){
+          const nx=x+dx, ny=y+dy;
+          if(nx>=0 && nx<w && ny>=0 && ny<h){ sum += gray[ny*w+nx]; count++; }
+        }
+      }
+      out[y*w+x] = sum/count;
+    }
+  }
+  return out;
+}
+function otsuThreshold(gray){
+  const hist = new Array(256).fill(0);
+  for(let i=0; i<gray.length; i++) hist[gray[i]|0]++;
+  const total = gray.length;
+  let sum=0;
+  for(let t=0; t<256; t++) sum += t*hist[t];
+  let sumB=0, wB=0, maxVar=0, threshold=127;
+  for(let t=0; t<256; t++){
+    wB += hist[t];
+    if(wB===0) continue;
+    const wF = total - wB;
+    if(wF===0) break;
+    sumB += t*hist[t];
+    const mB = sumB/wB, mF = (sum-sumB)/wF;
+    const varBetween = wB*wF*(mB-mF)*(mB-mF);
+    if(varBetween > maxVar){ maxVar = varBetween; threshold = t; }
+  }
+  return threshold;
+}
+function largestForegroundComponent(mask, w, h){
+  const labels = new Int32Array(w*h).fill(-1);
+  const queue = new Int32Array(w*h);
+  let bestLabel = -1, bestSize = 0, currentLabel = 0;
+  for(let start=0; start<w*h; start++){
+    if(mask[start] !== 1 || labels[start] !== -1) continue;
+    let qhead=0, qtail=0, size=0;
+    queue[qtail++] = start;
+    labels[start] = currentLabel;
+    while(qhead < qtail){
+      const idx = queue[qhead++];
+      size++;
+      const x = idx % w, y = (idx / w) | 0;
+      if(x > 0){ const n=idx-1; if(mask[n]===1 && labels[n]===-1){ labels[n]=currentLabel; queue[qtail++]=n; } }
+      if(x < w-1){ const n=idx+1; if(mask[n]===1 && labels[n]===-1){ labels[n]=currentLabel; queue[qtail++]=n; } }
+      if(y > 0){ const n=idx-w; if(mask[n]===1 && labels[n]===-1){ labels[n]=currentLabel; queue[qtail++]=n; } }
+      if(y < h-1){ const n=idx+w; if(mask[n]===1 && labels[n]===-1){ labels[n]=currentLabel; queue[qtail++]=n; } }
+    }
+    if(size > bestSize){ bestSize = size; bestLabel = currentLabel; }
+    currentLabel++;
+  }
+  return { labels, bestLabel, bestSize };
+}
+function detectDocumentQuad(img){
+  try{
+    const maxDim = 320;
+    const scale = Math.min(1, maxDim/Math.max(img.width, img.height));
+    const w = Math.max(1, Math.round(img.width*scale));
+    const h = Math.max(1, Math.round(img.height*scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+
+    const gray = new Float32Array(w*h);
+    for(let i=0; i<w*h; i++){
+      gray[i] = 0.299*data[i*4] + 0.587*data[i*4+1] + 0.114*data[i*4+2];
+    }
+    const blurred = boxBlur3x3(gray, w, h);
+    const threshold = otsuThreshold(blurred);
+
+    let borderSum=0, borderCount=0;
+    for(let x=0; x<w; x++){ borderSum += blurred[x] + blurred[(h-1)*w+x]; borderCount += 2; }
+    for(let y=0; y<h; y++){ borderSum += blurred[y*w] + blurred[y*w+w-1]; borderCount += 2; }
+    const borderIsDark = (borderSum/borderCount) < threshold;
+
+    const mask = new Uint8Array(w*h);
+    let fgCount = 0;
+    for(let i=0; i<w*h; i++){
+      const isDark = blurred[i] < threshold;
+      const isFg = borderIsDark ? !isDark : isDark;
+      mask[i] = isFg ? 1 : 0;
+      if(isFg) fgCount++;
+    }
+    const fgRatio = fgCount/(w*h);
+    if(fgRatio < 0.05 || fgRatio > 0.97) return null;
+
+    // Se queda solo con la mancha conectada más grande, para no confundirse
+    // con objetos sueltos (platos, tazas, etc.) que también contrasten con el fondo.
+    const { labels, bestLabel, bestSize } = largestForegroundComponent(mask, w, h);
+    if(bestLabel === -1 || bestSize/(w*h) < 0.05) return null;
+
+    let minSum=Infinity, maxSum=-Infinity, minDiff=Infinity, maxDiff=-Infinity;
+    let pTL=null, pBR=null, pTR=null, pBL=null;
+    for(let y=0; y<h; y++){
+      for(let x=0; x<w; x++){
+        const idx = y*w+x;
+        if(labels[idx] !== bestLabel) continue;
+        const s = x+y, d = x-y;
+        if(s < minSum){ minSum = s; pTL = {x,y}; }
+        if(s > maxSum){ maxSum = s; pBR = {x,y}; }
+        if(d > maxDiff){ maxDiff = d; pTR = {x,y}; }
+        if(d < minDiff){ minDiff = d; pBL = {x,y}; }
+      }
+    }
+    if(!pTL || !pTR || !pBR || !pBL) return null;
+
+    const scaleBack = 1/scale;
+    return [pTL, pTR, pBR, pBL].map(p => ({ x: p.x*scaleBack, y: p.y*scaleBack }));
+  }catch(e){
+
+    return null; // ante cualquier error, se usa el recorte por defecto
+  }
+}
+
+// ---------- Crop sheet (4 vértices independientes) ----------
+// opts: { mode:'new'|'edit', source, quad (natural px coords or null), filter, pageId }
+function openCropModal(opts){
+  return new Promise(async (resolveOuter)=>{
+    const sourceImg = await loadImg(opts.source);
+    let displayW = 0, displayH = 0;
+    let points = null; // 4 {x,y} in display px, order TL,TR,BR,BL
+    let dragState = null;
+
+    const html = `
+      <h3 style="margin-bottom:10px;">${opts.mode === 'new' ? 'Ajustar página nueva' : 'Editar página'}</h3>
+      <div class="crop-stage-wrap">
+        <div class="crop-stage" id="cropStage">
+          <img id="cropImg" src="${opts.source}">
+          <svg class="quad-svg"><polygon id="quadPoly" points=""></polygon></svg>
+          <div class="quad-handle" data-corner="0" id="h0"></div>
+          <div class="quad-handle" data-corner="1" id="h1"></div>
+          <div class="quad-handle" data-corner="2" id="h2"></div>
+          <div class="quad-handle" data-corner="3" id="h3"></div>
+        </div>
+      </div>
+      <button class="btn-block btn-ghost" id="cropResetQuad" style="margin-bottom:10px;">Restablecer recorte</button>
+      <div class="filter-options" id="cropFilterOptions">
+        <button data-f="color">Color</button>
+        <button data-f="gray">Grises</button>
+        <button data-f="bw">B/N doc.</button>
+      </div>
+      <button class="btn-block btn-primary" id="cropConfirm">${opts.mode === 'new' ? 'Agregar página' : 'Guardar cambios'}</button>
+      ${opts.mode === 'edit' ? `<button class="btn-block btn-danger" id="cropDelete">${ICONS.trash} Eliminar página</button>` : ''}
+      <button class="btn-block btn-ghost" id="cropCancel">Cancelar</button>
+    `;
+    const p = openSheet(html);
+    const backdrop = window.__lastSheet;
+
+    let currentFilter = opts.filter || settings.defaultFilter;
+    const filterBtns = backdrop.querySelectorAll('#cropFilterOptions [data-f]');
+    function updateFilterUI(){ filterBtns.forEach(b => b.classList.toggle('active', b.dataset.f === currentFilter)); }
+    filterBtns.forEach(b => b.addEventListener('click', ()=>{ currentFilter = b.dataset.f; updateFilterUI(); }));
+    updateFilterUI();
+
+    const cropImgEl = backdrop.querySelector('#cropImg');
+    const cropStage = backdrop.querySelector('#cropStage');
+    const quadPoly = backdrop.querySelector('#quadPoly');
+    const handles = [0,1,2,3].map(i => backdrop.querySelector(`#h${i}`));
+
+    function defaultPoints(){
+      const inset = 0.045;
+      return [
+        { x: displayW*inset, y: displayH*inset },
+        { x: displayW*(1-inset), y: displayH*inset },
+        { x: displayW*(1-inset), y: displayH*(1-inset) },
+        { x: displayW*inset, y: displayH*(1-inset) }
+      ];
+    }
+    function initPoints(){
+      displayW = cropImgEl.clientWidth; displayH = cropImgEl.clientHeight;
+      const scaleToDisplay = displayW / sourceImg.width;
+      if(opts.quad){
+        points = opts.quad.map(pt => ({ x: pt.x*scaleToDisplay, y: pt.y*scaleToDisplay }));
+      } else {
+        const detected = detectDocumentQuad(sourceImg);
+        if(detected){
+          points = detected.map(pt => ({ x: pt.x*scaleToDisplay, y: pt.y*scaleToDisplay }));
+          showToast('Bordes detectados automáticamente — ajustalos si hace falta.');
+        } else {
+          points = defaultPoints();
+        }
+      }
+      paint();
+    }
+    function paint(){
+      quadPoly.setAttribute('points', points.map(pt => `${pt.x},${pt.y}`).join(' '));
+      points.forEach((pt,i) => { handles[i].style.left = pt.x+'px'; handles[i].style.top = pt.y+'px'; });
+    }
+    function clamp(v,min,max){ return Math.min(Math.max(v,min),max); }
+    function stagePoint(e){
+      const r = cropStage.getBoundingClientRect();
+      const pt = e.touches ? e.touches[0] : e;
+      return { x: pt.clientX - r.left, y: pt.clientY - r.top };
+    }
+    function onPointerDown(e){
+      const handle = e.target.closest('.quad-handle');
+      const onPoly = e.target.closest('#quadPoly');
+      const sp = stagePoint(e);
+
+      if(handle){
+        e.preventDefault();
+        dragState = { mode:'point', idx: Number(handle.dataset.corner), start:sp, startPoints: points.map(pt=>({...pt})) };
+        return;
+      }
+      // Tolerancia extra: si el dedo cayó cerca de un vértice (aunque no justo
+      // encima), lo agarra igual — mucho más cómodo que tener que acertarle pixel a pixel.
+      let nearestIdx = -1, nearestDist = Infinity;
+      points.forEach((pt, i) => {
+        const d = Math.hypot(pt.x - sp.x, pt.y - sp.y);
+        if(d < nearestDist){ nearestDist = d; nearestIdx = i; }
+      });
+      if(nearestIdx !== -1 && nearestDist < 42){
+        e.preventDefault();
+        dragState = { mode:'point', idx: nearestIdx, start:sp, startPoints: points.map(pt=>({...pt})) };
+        return;
+      }
+      if(onPoly){
+        e.preventDefault();
+        dragState = { mode:'all', start:sp, startPoints: points.map(pt=>({...pt})) };
+      }
+    }
+    function onPointerMove(e){
+      if(!dragState) return;
+      e.preventDefault();
+      const sp = stagePoint(e);
+      const dx = sp.x - dragState.start.x, dy = sp.y - dragState.start.y;
+      if(dragState.mode === 'point'){
+        const idx = dragState.idx;
+        points[idx] = {
+          x: clamp(dragState.startPoints[idx].x + dx, 0, displayW),
+          y: clamp(dragState.startPoints[idx].y + dy, 0, displayH)
+        };
+      } else {
+        let minDx=-Infinity, maxDx=Infinity, minDy=-Infinity, maxDy=Infinity;
+        dragState.startPoints.forEach(pt=>{
+          minDx = Math.max(minDx, -pt.x); maxDx = Math.min(maxDx, displayW-pt.x);
+          minDy = Math.max(minDy, -pt.y); maxDy = Math.min(maxDy, displayH-pt.y);
+        });
+        const cdx = clamp(dx, minDx, maxDx), cdy = clamp(dy, minDy, maxDy);
+        points = dragState.startPoints.map(pt => ({ x: pt.x+cdx, y: pt.y+cdy }));
+      }
+      paint();
+    }
+    function onPointerUp(){ dragState = null; }
+
+    cropStage.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('pointermove', onPointerMove);
+    document.addEventListener('pointerup', onPointerUp);
+
+    if(cropImgEl.complete && cropImgEl.naturalWidth) requestAnimationFrame(initPoints);
+    else cropImgEl.addEventListener('load', () => requestAnimationFrame(initPoints));
+
+    backdrop.querySelector('#cropResetQuad').addEventListener('click', ()=>{ points = defaultPoints(); paint(); });
+
+    function cleanup(){
+      document.removeEventListener('pointermove', onPointerMove);
+      document.removeEventListener('pointerup', onPointerUp);
+    }
+    backdrop.addEventListener('click', (e)=>{ if(e.target === backdrop){ cleanup(); closeSheet(); resolveOuter(null); } });
+    backdrop.querySelector('#cropCancel').addEventListener('click', ()=>{ cleanup(); closeSheet(); resolveOuter(null); });
+    const delBtn = backdrop.querySelector('#cropDelete');
+    if(delBtn) delBtn.addEventListener('click', ()=>{ cleanup(); closeSheet(); resolveOuter({ action:'delete' }); });
+    backdrop.querySelector('#cropConfirm').addEventListener('click', ()=>{
+      const scaleToNatural = sourceImg.width / displayW;
+      const quadNatural = points.map(pt => ({ x: pt.x*scaleToNatural, y: pt.y*scaleToNatural }));
+      cleanup(); closeSheet();
+      resolveOuter({ action:'confirm', quad: quadNatural, filter: currentFilter });
+    });
+    await p;
+  });
+}
+
+// ---------- Core actions ----------
+async function startNewCapture(file){
+  const img = await fileToImage(file);
+  const source = resizeToDataUrl(img, 1600);
+  const result = await openCropModal({ mode:'new', source, quad:null, filter: settings.defaultFilter });
+  if(!result || result.action !== 'confirm') return;
+
+  showToast('Procesando página…');
+  await new Promise(r => setTimeout(r, 30)); // deja pintar el toast antes de la tarea pesada
+  const processed = await warpAndFilter(source, result.quad, result.filter);
+  const id = (crypto.randomUUID ? crypto.randomUUID() : 'p'+Date.now()+Math.random());
+  const page = { id, source, quad: result.quad, filter: result.filter, processed, timestamp: Date.now() };
+
+  if(!sessionMeta.createdAt) sessionMeta.createdAt = Date.now();
+  sessionMeta.pageOrder.push(id);
+  pagesById[id] = page;
+  await savePage(page);
+  await saveMeta();
+  render(true, id);
+}
+
+async function editPage(id){
+  const page = pagesById[id];
+  if(!page) return;
+  const source = page.source || page.original;
+  const quad = page.quad || (page.cropRect ? rectToQuad(page.cropRect) : null);
+  const result = await openCropModal({ mode:'edit', source, quad, filter: page.filter, pageId: id });
+  if(!result) return;
+  if(result.action === 'delete'){ await deletePage(id); return; }
+  if(result.action === 'confirm'){
+    showToast('Actualizando página…');
+    await new Promise(r => setTimeout(r, 30));
+    page.quad = result.quad;
+    delete page.cropRect;
+    page.filter = result.filter;
+    page.processed = await warpAndFilter(source, result.quad, result.filter);
+    await savePage(page);
+    render();
+  }
+}
+
+async function deletePage(id){
+  delete pagesById[id];
+  sessionMeta.pageOrder = sessionMeta.pageOrder.filter(x => x !== id);
+  await deletePageStorage(id);
+  await saveMeta();
+  render();
+}
+async function movePage(id, dir){
+  const order = sessionMeta.pageOrder;
+  const idx = order.indexOf(id);
+  const swapWith = idx + dir;
+  if(swapWith < 0 || swapWith >= order.length) return;
+  [order[idx], order[swapWith]] = [order[swapWith], order[idx]];
+  await saveMeta();
+  render();
+}
+async function resetSession(){
+  if(!confirm('¿Borrar todas las páginas de esta sesión? Esta acción no se puede deshacer.')) return;
+  for(const id of sessionMeta.pageOrder) await deletePageStorage(id);
+  sessionMeta = { createdAt: null, pageOrder: [] };
+  pagesById = {};
+  await saveMeta();
+  render();
+  showToast('Sesión reiniciada.');
+}
+
+// ---------- PDF ----------
+let pdfBlobCache = null;
+let pdfBlobPromise = null;
+function invalidatePdfCache(){ pdfBlobCache = null; pdfBlobPromise = null; }
+async function getPdfBlob(){
+  if(pdfBlobCache) return pdfBlobCache;
+  if(!pdfBlobPromise) pdfBlobPromise = buildPdfBlob().then(b => { pdfBlobCache = b; return b; });
+  return pdfBlobPromise;
+}
+
+async function buildPdfBlob(){
+  const pdf = new jsPDF({ unit:'pt', format:'a4' });
+  const pageW = pdf.internal.pageSize.getWidth();
+  const pageH = pdf.internal.pageSize.getHeight();
+  const margin = 24;
+  for(let i=0; i<sessionMeta.pageOrder.length; i++){
+    const page = pagesById[sessionMeta.pageOrder[i]];
+    if(i>0) pdf.addPage();
+    const img = await loadImg(page.processed);
+    const availW = pageW - margin*2, availH = pageH - margin*2;
+    const scale = Math.min(availW/img.width, availH/img.height);
+    const w = img.width*scale, h = img.height*scale;
+    const x = (pageW-w)/2, y = (pageH-h)/2;
+    pdf.addImage(page.processed, 'JPEG', x, y, w, h);
+  }
+  return pdf.output('blob');
+}
+async function exportPdf(){
+  if(sessionMeta.pageOrder.length === 0) return;
+  showToast('Generando PDF…');
+  const blob = await getPdfBlob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `documento-escaneado-${new Date().toISOString().slice(0,10)}.pdf`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=> URL.revokeObjectURL(url), 5000);
+}
+async function sharePdf(){
+  if(sessionMeta.pageOrder.length === 0) return;
+  showToast('Preparando para compartir…');
+  const blob = await getPdfBlob();
+  const file = new File([blob], `documento-escaneado-${new Date().toISOString().slice(0,10)}.pdf`, { type:'application/pdf' });
+
+  if(navigator.share){
+    const canShareFiles = !navigator.canShare || navigator.canShare({ files:[file] });
+    if(canShareFiles){
+      try{
+        await navigator.share({ files:[file], title:'Documento escaneado' });
+        return; // se compartió bien
+      }catch(err){
+        if(err && err.name === 'AbortError') return; // el usuario cerró el panel: no hacer nada más
+        showToast('No se pudo compartir (' + (err && err.message ? err.message : 'error desconocido') + '). Se descarga el PDF.');
+      }
+    } else {
+      showToast('Este navegador no admite compartir archivos PDF. Se descarga el PDF.');
+    }
+  } else {
+    showToast('Este navegador no tiene función de compartir. Se descarga el PDF.');
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = file.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=> URL.revokeObjectURL(url), 5000);
+}
+
+// ---------- Rendering ----------
+function fmtElapsed(ms){
+  const mins = Math.floor(ms/60000);
+  if(mins < 1) return 'recién empezó';
+  if(mins < 60) return `hace ${mins} min`;
+  const hrs = Math.floor(mins/60), remMins = mins%60;
+  return `hace ${hrs} h ${remMins} min`;
+}
+function updateStatus(){
+  const n = sessionMeta.pageOrder.length;
+  statusText.textContent = n === 0 ? 'Sin páginas' : `${n} página${n===1?'':'s'} · ${fmtElapsed(Date.now()-sessionMeta.createdAt)}`;
+  pageBadge.textContent = n;
+  pageBadge.style.display = n === 0 ? 'none' : 'flex';
+}
+
+function render(justAdded, newId){
+  invalidatePdfCache();
+  const n = sessionMeta.pageOrder.length;
+  emptyState.style.display = n === 0 ? 'block' : 'none';
+  grid.innerHTML = '';
+
+  sessionMeta.pageOrder.forEach((id, i) => {
+    const page = pagesById[id];
+    if(!page) return;
+    const card = document.createElement('div');
+    card.className = 'page-card';
+    card.style.animationDelay = (i * 0.03) + 's';
+    const time = new Date(page.timestamp).toLocaleTimeString('es-AR', {hour:'2-digit', minute:'2-digit'});
+    card.innerHTML = `
+      <div class="thumb-wrap">
+        <img src="${page.processed}" data-id="${id}" class="thumb-img">
+        <div class="thumb-scrim"></div>
+        <span class="page-num">${i+1} / ${n}</span>
+        <button class="del-btn" data-del="${id}">${ICONS.close}</button>
+        <div class="card-footer">
+          <span class="filter-chip">${FILTER_LABEL[page.filter]} · ${time}</span>
+          <div class="move-btns">
+            <button data-up="${id}" ${i===0?'disabled':''}>${ICONS.up}</button>
+            <button data-down="${id}" ${i===n-1?'disabled':''}>${ICONS.down}</button>
+          </div>
+        </div>
+        ${justAdded && id === newId ? '<div class="scan-sweep"></div>' : ''}
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+
+  grid.querySelectorAll('.thumb-img').forEach(el => el.addEventListener('click', ()=> editPage(el.dataset.id)));
+  grid.querySelectorAll('[data-del]').forEach(el => el.addEventListener('click', (e)=>{ e.stopPropagation(); deletePage(el.dataset.del); }));
+  grid.querySelectorAll('[data-up]').forEach(el => el.addEventListener('click', (e)=>{ e.stopPropagation(); movePage(el.dataset.up, -1); }));
+  grid.querySelectorAll('[data-down]').forEach(el => el.addEventListener('click', (e)=>{ e.stopPropagation(); movePage(el.dataset.down, 1); }));
+
+  updateStatus();
+}
+
+// ---------- Input wiring ----------
+$('btnCamera').addEventListener('click', ()=> $('fileInputCamera').click());
+$('btnGallery').addEventListener('click', ()=> $('fileInputGallery').click());
+$('btnMenu').addEventListener('click', openSettingsSheet);
+$('btnPdfMenu').addEventListener('click', openPdfSheet);
+
+async function handleFiles(fileList){
+  const files = Array.from(fileList || []);
+  for(const file of files){
+    if(!file.type.startsWith('image/')) continue;
+    await startNewCapture(file);
+  }
+}
+$('fileInputCamera').addEventListener('change', (e)=>{ handleFiles(e.target.files); e.target.value=''; });
+$('fileInputGallery').addEventListener('change', (e)=>{ handleFiles(e.target.files); e.target.value=''; });
+
+setInterval(updateStatus, 60000);
+loadSettings().then(loadSession);
+</script>
+</body>
+</html>
